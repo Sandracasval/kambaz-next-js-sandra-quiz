@@ -8,6 +8,7 @@ import { useSelector } from "react-redux";
 import { RootState } from "../../../../../store";
 import * as client from "../../client";
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
 export default function QuizPreview() {
   const params = useParams();
   const router = useRouter();
@@ -26,8 +27,9 @@ export default function QuizPreview() {
     timeLimit: 20,
   });
 
+  // NOTE: allow string OR string[] (for multiple FIB blanks)
   const [selectedAnswers, setSelectedAnswers] = useState<{
-    [key: number]: string;
+    [key: number]: string | string[];
   }>({});
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [score, setScore] = useState(0);
@@ -46,11 +48,39 @@ export default function QuizPreview() {
     fetchQuiz();
   }, [quizId]);
 
+  // For MCQ + TF (single value)
   const handleAnswerChange = (questionIndex: number, answer: string) => {
     if (isSubmitted) return; // Don't allow changes after submission
     setSelectedAnswers({
       ...selectedAnswers,
       [questionIndex]: answer,
+    });
+    updateSavedTime();
+  };
+
+  // For FIB (multiple blanks)
+  const handleFibAnswerChange = (
+    questionIndex: number,
+    blankIndex: number,
+    value: string,
+    totalBlanks: number
+  ) => {
+    if (isSubmitted) return;
+
+    const existing = selectedAnswers[questionIndex];
+    let arr: string[] = [];
+
+    if (Array.isArray(existing)) {
+      arr = [...existing];
+    } else {
+      arr = Array(totalBlanks).fill("");
+    }
+
+    arr[blankIndex] = value;
+
+    setSelectedAnswers({
+      ...selectedAnswers,
+      [questionIndex]: arr,
     });
     updateSavedTime();
   };
@@ -70,9 +100,32 @@ export default function QuizPreview() {
     quiz.questions.forEach((question: any, index: number) => {
       const userAnswer = selectedAnswers[index];
 
+      // FILL-IN-THE-BLANK: multiple blanks
+      if (question.type === "FIB") {
+        const correctAnswers: string[] = question.answers || [];
+
+        if (!Array.isArray(userAnswer) || correctAnswers.length === 0) return;
+
+        const normalizedCorrect = correctAnswers.map((a: string) =>
+          a?.toString().trim().toLowerCase()
+        );
+        const normalizedUser = userAnswer.map((a: string) =>
+          (a || "").toString().trim().toLowerCase()
+        );
+
+        const allMatch = normalizedCorrect.every(
+          (ans, i) => (normalizedUser[i] || "") === ans
+        );
+
+        if (allMatch) {
+          totalScore += question.points || 0;
+        }
+        return;
+      }
+
+      // MCQ / TF (single answer)
       if (!userAnswer) return; // Skip unanswered questions
 
-      // Check if answer is correct (case-insensitive comparison)
       const correctAnswer = question.correctAnswer
         ?.toString()
         .trim()
@@ -123,6 +176,27 @@ export default function QuizPreview() {
     const question = quiz.questions[questionIndex];
     const userAnswer = selectedAnswers[questionIndex];
 
+    if (!question) return false;
+
+    // FIB correctness (all blanks must match)
+    if (question.type === "FIB") {
+      const correctAnswers: string[] = question.answers || [];
+      if (!Array.isArray(userAnswer) || correctAnswers.length === 0)
+        return false;
+
+      const normalizedCorrect = correctAnswers.map((a: string) =>
+        a?.toString().trim().toLowerCase()
+      );
+      const normalizedUser = userAnswer.map((a: string) =>
+        (a || "").toString().trim().toLowerCase()
+      );
+
+      return normalizedCorrect.every(
+        (ans, i) => (normalizedUser[i] || "") === ans
+      );
+    }
+
+    // MCQ / TF (single answer)
     if (!userAnswer || !question.correctAnswer) return false;
 
     const correctAnswer = question.correctAnswer
@@ -212,6 +286,26 @@ export default function QuizPreview() {
           const correct = isSubmitted && isAnswerCorrect(qIndex);
           const incorrect = isSubmitted && selectedAnswers[qIndex] && !correct;
 
+          const isFillInBlank = question.type === "FIB";
+          const isTrueFalse = question.type === "TF";
+
+          // For FIB we use answers[] to determine # of blanks
+          const fibCorrectAnswers: string[] =
+            question.answers && question.answers.length > 0
+              ? question.answers
+              : question.correctAnswer
+              ? [question.correctAnswer]
+              : [];
+
+          const fibBlanksCount =
+            isFillInBlank && fibCorrectAnswers.length > 0
+              ? fibCorrectAnswers.length
+              : 1;
+
+          const fibUserAnswers = Array.isArray(selectedAnswers[qIndex])
+            ? (selectedAnswers[qIndex] as string[])
+            : [];
+
           return (
             <Card
               className={`mb-3 ${
@@ -246,8 +340,12 @@ export default function QuizPreview() {
                 <p className="mb-3">{question.questionText}</p>
 
                 <Form>
-                  {/* Multiple Choice or True/False */}
-                  {question.choices && question.choices.length > 0 ? (
+                  {/* MCQ / TF / FIB */}
+                  {!isFillInBlank &&
+                  !isTrueFalse &&
+                  question.choices &&
+                  question.choices.length > 0 ? (
+                    // MCQ: show provided choices
                     question.choices.map((choice: string, cIndex: number) => {
                       const isSelected = selectedAnswers[qIndex] === choice;
                       const isCorrectChoice =
@@ -292,39 +390,101 @@ export default function QuizPreview() {
                         />
                       );
                     })
+                  ) : isTrueFalse ? (
+                    // TRUE/FALSE: always show exactly two options
+                    ["True", "False"].map((choice, cIndex) => {
+                      const isSelected = selectedAnswers[qIndex] === choice;
+                      const isCorrectChoice =
+                        isSubmitted &&
+                        choice.toLowerCase().trim() ===
+                          question.correctAnswer?.toLowerCase().trim();
+
+                      return (
+                        <Form.Check
+                          key={cIndex}
+                          type="radio"
+                          name={`question-${qIndex}`}
+                          id={`q${qIndex}-tf-${cIndex}`}
+                          label={
+                            <span>
+                              {choice}
+                              {isSubmitted && isCorrectChoice && (
+                                <span className="ms-2 text-success fw-bold">
+                                  Correct
+                                </span>
+                              )}
+                              {isSubmitted &&
+                                isSelected &&
+                                !isCorrectChoice && (
+                                  <span className="ms-2 text-danger fw-bold">
+                                    Your answer
+                                  </span>
+                                )}
+                            </span>
+                          }
+                          value={choice}
+                          checked={isSelected}
+                          onChange={(e) =>
+                            handleAnswerChange(qIndex, e.target.value)
+                          }
+                          className={`mb-2 ${
+                            isSubmitted && isCorrectChoice
+                              ? "text-success fw-bold"
+                              : ""
+                          }`}
+                          disabled={isSubmitted}
+                        />
+                      );
+                    })
                   ) : (
-                    /* Fill in the Blank */
-                    <Form.Group>
-                      <Form.Control
-                        type="text"
-                        placeholder="Enter your answer"
-                        value={selectedAnswers[qIndex] || ""}
-                        onChange={(e) =>
-                          handleAnswerChange(qIndex, e.target.value)
+                    // FIB: multiple blanks based on answers[]
+                    <div>
+                      {Array.from({ length: fibBlanksCount }).map(
+                        (_, blankIndex) => {
+                          const correctText =
+                            fibCorrectAnswers[blankIndex] || "";
+                          const userText = fibUserAnswers[blankIndex] || "";
+                          const thisBlankCorrect =
+                            isSubmitted &&
+                            userText.toString().trim().toLowerCase() ===
+                              correctText.toString().trim().toLowerCase();
+
+                          return (
+                            <Form.Group key={blankIndex} className="mb-2">
+                              <Form.Label>Blank {blankIndex + 1}</Form.Label>
+                              <Form.Control
+                                type="text"
+                                placeholder="Enter your answer"
+                                value={userText}
+                                onChange={(e) =>
+                                  handleFibAnswerChange(
+                                    qIndex,
+                                    blankIndex,
+                                    e.target.value,
+                                    fibBlanksCount
+                                  )
+                                }
+                                disabled={isSubmitted}
+                                className={
+                                  isSubmitted
+                                    ? thisBlankCorrect
+                                      ? "border-success"
+                                      : "border-danger"
+                                    : ""
+                                }
+                              />
+                            </Form.Group>
+                          );
                         }
-                        disabled={isSubmitted}
-                        className={
-                          isSubmitted
-                            ? correct
-                              ? "border-success"
-                              : "border-danger"
-                            : ""
-                        }
-                      />
-                      {isSubmitted && (
+                      )}
+                      {isSubmitted && fibCorrectAnswers.length > 0 && (
                         <Form.Text
                           className={correct ? "text-success" : "text-danger"}
                         >
-                          {correct ? (
-                            <span>Correct!</span>
-                          ) : (
-                            <span>
-                              Correct answer: {question.correctAnswer}
-                            </span>
-                          )}
+                          Correct answers: {fibCorrectAnswers.join(", ")}
                         </Form.Text>
                       )}
-                    </Form.Group>
+                    </div>
                   )}
                 </Form>
               </Card.Body>

@@ -1,4 +1,3 @@
-
 // Student Quiz Taking Screen
 "use client";
 
@@ -30,8 +29,9 @@ export default function StudentQuizTaking() {
     oneQuestionAtATime: true,
   });
 
+  // string for MCQ/TF, string[] for FIB (in React state only)
   const [selectedAnswers, setSelectedAnswers] = useState<{
-    [key: number]: string;
+    [key: number]: string | string[];
   }>({});
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [score, setScore] = useState(0);
@@ -56,7 +56,7 @@ export default function StudentQuizTaking() {
     try {
       // Get attempt count
       const countData = await client.getAttemptCount(quizId, currentUser._id);
-      setAttemptCount(Math.max(0, countData.count || 0)); // Ensure non-negative
+      setAttemptCount(Math.max(0, countData.count || 0));
 
       // Get latest attempt
       const latest = await client.findLatestAttempt(quizId, currentUser._id);
@@ -65,11 +65,19 @@ export default function StudentQuizTaking() {
         setViewingPreviousAttempt(true);
         setIsSubmitted(true);
 
-        // Populate answers from the latest attempt
-        const answersMap: { [key: number]: string } = {};
+        // Restore answers into state (parse JSON for FIB if needed)
+        const answersMap: { [key: number]: string | string[] } = {};
         if (latest.answers && Array.isArray(latest.answers)) {
           latest.answers.forEach((ans: any) => {
-            answersMap[ans.questionIndex] = ans.answer;
+            let value: any = ans.answer;
+            if (typeof value === "string" && value.trim().startsWith("[")) {
+              try {
+                value = JSON.parse(value);
+              } catch {
+                // leave as string if not valid JSON
+              }
+            }
+            answersMap[ans.questionIndex] = value;
           });
         }
         setSelectedAnswers(answersMap);
@@ -77,7 +85,6 @@ export default function StudentQuizTaking() {
       }
     } catch (error) {
       console.error("Error fetching attempt data:", error);
-      // Continue with default values (0 attempts)
       setAttemptCount(0);
     }
   };
@@ -87,6 +94,7 @@ export default function StudentQuizTaking() {
     fetchAttemptData();
   }, [quizId, currentUser]);
 
+  // MCQ + TF single-answer handler
   const handleAnswerChange = (questionIndex: number, answer: string) => {
     if (isSubmitted || viewingPreviousAttempt) return;
     setSelectedAnswers({
@@ -95,6 +103,35 @@ export default function StudentQuizTaking() {
     });
     updateSavedTime();
     saveProgress(questionIndex, answer);
+  };
+
+  // FIB: multi-blank handler (array in state)
+  const handleFibAnswerChange = (
+    questionIndex: number,
+    blankIndex: number,
+    value: string,
+    totalBlanks: number
+  ) => {
+    if (isSubmitted || viewingPreviousAttempt) return;
+
+    const existing = selectedAnswers[questionIndex];
+    let arr: string[] = [];
+
+    if (Array.isArray(existing)) {
+      arr = [...existing];
+    } else {
+      arr = Array(totalBlanks).fill("");
+    }
+
+    arr[blankIndex] = value;
+
+    setSelectedAnswers({
+      ...selectedAnswers,
+      [questionIndex]: arr,
+    });
+
+    updateSavedTime();
+    saveProgress(questionIndex, arr);
   };
 
   const updateSavedTime = () => {
@@ -107,17 +144,22 @@ export default function StudentQuizTaking() {
     setLastSavedTime(timeString);
   };
 
-  const saveProgress = async (questionIndex: number, answer: string) => {
+  // IMPORTANT: in DB, always store answer as a string (JSON for FIB)
+  const saveProgress = async (
+    questionIndex: number,
+    answer: string | string[]
+  ) => {
     if (!currentUser || viewingPreviousAttempt) return;
 
+    const persistedAnswer = Array.isArray(answer)
+      ? JSON.stringify(answer)
+      : answer;
+
     try {
-      // Create attempt if it doesn't exist
       if (!currentAttempt) {
-        // Get fresh attempt count to ensure correct attempt number
         const countData = await client.getAttemptCount(quizId, currentUser._id);
         const freshCount = Math.max(0, countData.count || 0);
 
-        // Validate that user can still take this quiz
         const maxAttempts = quiz.multipleAttempts
           ? quiz.howManyAttempts || 1
           : 1;
@@ -132,7 +174,9 @@ export default function StudentQuizTaking() {
           userId: currentUser._id,
           courseId,
           attemptNumber: freshCount + 1,
-          answers: [{ questionIndex, answer, isCorrect: false }],
+          answers: [
+            { questionIndex, answer: persistedAnswer, isCorrect: false },
+          ],
           score: 0,
           totalPoints: quiz.questions.reduce(
             (sum: number, q: any) => sum + (q.points || 0),
@@ -142,9 +186,8 @@ export default function StudentQuizTaking() {
         };
         const created = await client.createAttempt(newAttempt);
         setCurrentAttempt(created);
-        setAttemptCount(freshCount); // Update local state
+        setAttemptCount(freshCount);
       } else {
-        // Update existing attempt
         const updatedAnswers = [...(currentAttempt.answers || [])];
         const existingIndex = updatedAnswers.findIndex(
           (a: any) => a.questionIndex === questionIndex
@@ -153,11 +196,15 @@ export default function StudentQuizTaking() {
         if (existingIndex >= 0) {
           updatedAnswers[existingIndex] = {
             questionIndex,
-            answer,
+            answer: persistedAnswer,
             isCorrect: false,
           };
         } else {
-          updatedAnswers.push({ questionIndex, answer, isCorrect: false });
+          updatedAnswers.push({
+            questionIndex,
+            answer: persistedAnswer,
+            isCorrect: false,
+          });
         }
 
         await client.updateAttempt(currentAttempt._id, {
@@ -167,10 +214,10 @@ export default function StudentQuizTaking() {
       }
     } catch (error) {
       console.error("Error saving progress:", error);
-      // Don't alert the user here as this happens on every answer change
     }
   };
 
+  // Scoring: FIB uses arrays in state; answers we return use strings for DB
   const calculateScore = () => {
     let totalScore = 0;
     const answersWithCorrectness: any[] = [];
@@ -178,7 +225,13 @@ export default function StudentQuizTaking() {
     quiz.questions.forEach((question: any, index: number) => {
       const userAnswer = selectedAnswers[index];
 
-      if (!userAnswer) {
+      // Unanswered
+      if (
+        userAnswer === undefined ||
+        userAnswer === null ||
+        (Array.isArray(userAnswer) &&
+          userAnswer.every((a) => !a || a.toString().trim() === ""))
+      ) {
         answersWithCorrectness.push({
           questionIndex: index,
           answer: "",
@@ -187,12 +240,56 @@ export default function StudentQuizTaking() {
         return;
       }
 
+      // FIB: compare arrays, then store JSON string
+      if (question.type === "FIB") {
+        const correctAnswers: string[] =
+          question.answers && question.answers.length > 0
+            ? question.answers
+            : question.correctAnswer
+            ? [question.correctAnswer]
+            : [];
+
+        if (!Array.isArray(userAnswer) || correctAnswers.length === 0) {
+          answersWithCorrectness.push({
+            questionIndex: index,
+            answer: Array.isArray(userAnswer)
+              ? JSON.stringify(userAnswer)
+              : userAnswer,
+            isCorrect: false,
+          });
+          return;
+        }
+
+        const normalizedCorrect = correctAnswers.map((a: string) =>
+          a?.toString().trim().toLowerCase()
+        );
+        const normalizedUser = userAnswer.map((a: string) =>
+          (a || "").toString().trim().toLowerCase()
+        );
+
+        const allMatch = normalizedCorrect.every(
+          (ans, i) => (normalizedUser[i] || "") === ans
+        );
+
+        if (allMatch) {
+          totalScore += question.points || 0;
+        }
+
+        answersWithCorrectness.push({
+          questionIndex: index,
+          answer: JSON.stringify(userAnswer),
+          isCorrect: allMatch,
+        });
+        return;
+      }
+
+      // MCQ / TF (single string)
       const correctAnswer = question.correctAnswer
         ?.toString()
         .trim()
         .toLowerCase();
       const providedAnswer = userAnswer.toString().trim().toLowerCase();
-      const isCorrect = correctAnswer === providedAnswer;
+      const isCorrect = !!correctAnswer && correctAnswer === providedAnswer;
 
       if (isCorrect) {
         totalScore += question.points || 0;
@@ -216,7 +313,6 @@ export default function StudentQuizTaking() {
       setScore(calculatedScore);
       setIsSubmitted(true);
 
-      // Update or create attempt with final submission
       if (currentAttempt) {
         await client.updateAttempt(currentAttempt._id, {
           answers,
@@ -225,7 +321,6 @@ export default function StudentQuizTaking() {
           isSubmitted: true,
         });
       } else {
-        // Get fresh attempt count
         const countData = await client.getAttemptCount(quizId, currentUser._id);
         const freshCount = Math.max(0, countData.count || 0);
 
@@ -246,12 +341,11 @@ export default function StudentQuizTaking() {
         });
       }
 
-      // Refresh attempt data to get updated count
       await fetchAttemptData();
     } catch (error) {
       console.error("Error submitting quiz:", error);
       alert("Failed to submit quiz. Please try again.");
-      setIsSubmitted(false); // Allow retry
+      setIsSubmitted(false);
     }
   };
 
@@ -279,21 +373,18 @@ export default function StudentQuizTaking() {
   };
 
   const handleStartNewAttempt = async () => {
-    // Re-fetch attempt data to get latest count
     if (!quizId || !currentUser) return;
 
     try {
       const countData = await client.getAttemptCount(quizId, currentUser._id);
       const freshAttemptCount = Math.max(0, countData.count || 0);
 
-      // Validate that user can take another attempt
       const maxAttempts = quiz.multipleAttempts ? quiz.howManyAttempts || 1 : 1;
       if (freshAttemptCount >= maxAttempts) {
         alert("You have already used all available attempts for this quiz.");
         return;
       }
 
-      // Update state with fresh count
       setAttemptCount(freshAttemptCount);
       setViewingPreviousAttempt(false);
       setIsSubmitted(false);
@@ -311,6 +402,31 @@ export default function StudentQuizTaking() {
     const question = quiz.questions[questionIndex];
     const userAnswer = selectedAnswers[questionIndex];
 
+    if (!question) return false;
+
+    if (question.type === "FIB") {
+      const correctAnswers: string[] =
+        question.answers && question.answers.length > 0
+          ? question.answers
+          : question.correctAnswer
+          ? [question.correctAnswer]
+          : [];
+
+      if (!Array.isArray(userAnswer) || correctAnswers.length === 0)
+        return false;
+
+      const normalizedCorrect = correctAnswers.map((a: string) =>
+        a?.toString().trim().toLowerCase()
+      );
+      const normalizedUser = userAnswer.map((a: string) =>
+        (a || "").toString().trim().toLowerCase()
+      );
+
+      return normalizedCorrect.every(
+        (ans, i) => (normalizedUser[i] || "") === ans
+      );
+    }
+
     if (!userAnswer || !question.correctAnswer) return false;
 
     const correctAnswer = question.correctAnswer
@@ -324,7 +440,6 @@ export default function StudentQuizTaking() {
 
   if (!currentUser) return null;
 
-  // Redirect faculty to preview
   if (currentUser.role === "FACULTY") {
     router.push(`/Courses/${courseId}/Quizzes/${quizId}/Preview`);
     return null;
@@ -419,7 +534,6 @@ export default function StudentQuizTaking() {
             {quiz.multipleAttempts ? quiz.howManyAttempts : 1}
           </Alert>
 
-          {/* Quiz Info */}
           <div className="mb-4">
             <p className="mb-2">
               Started:{" "}
@@ -456,6 +570,25 @@ export default function StudentQuizTaking() {
           const correct = isSubmitted && isAnswerCorrect(qIndex);
           const incorrect = isSubmitted && selectedAnswers[qIndex] && !correct;
 
+          const isFillInBlank = question.type === "FIB";
+          const isTrueFalse = question.type === "TF";
+
+          const fibCorrectAnswers: string[] =
+            question.answers && question.answers.length > 0
+              ? question.answers
+              : question.correctAnswer
+              ? [question.correctAnswer]
+              : [];
+
+          const fibBlanksCount =
+            isFillInBlank && fibCorrectAnswers.length > 0
+              ? fibCorrectAnswers.length
+              : 1;
+
+          const fibUserAnswers = Array.isArray(selectedAnswers[qIndex])
+            ? (selectedAnswers[qIndex] as string[])
+            : [];
+
           return (
             <Card
               className={`mb-3 ${
@@ -479,85 +612,156 @@ export default function StudentQuizTaking() {
                 <p className="mb-3">{question.questionText}</p>
 
                 <Form>
-                  {/* Multiple Choice or True/False */}
-                  {question.choices && question.choices.length > 0 ? (
-                    question.choices.map((choice: string, cIndex: number) => {
-                      const isSelected = selectedAnswers[qIndex] === choice;
-                      const isCorrectChoice =
-                        isSubmitted &&
-                        choice.toLowerCase().trim() ===
-                          question.correctAnswer?.toLowerCase().trim();
+                  {!isFillInBlank &&
+                  !isTrueFalse &&
+                  question.choices &&
+                  question.choices.length > 0 ? (
+                    // MCQ
+                    <>
+                      {question.choices.map(
+                        (choice: string, cIndex: number) => {
+                          const isSelected = selectedAnswers[qIndex] === choice;
+                          const isCorrectChoice =
+                            isSubmitted &&
+                            choice.toLowerCase().trim() ===
+                              question.correctAnswer?.toLowerCase().trim();
 
-                      return (
-                        <Form.Check
-                          key={cIndex}
-                          type="radio"
-                          name={`question-${qIndex}`}
-                          id={`q${qIndex}-choice${cIndex}`}
-                          label={
-                            <span>
-                              {choice}
-                              {isSubmitted && isCorrectChoice && (
-                                <span className="ms-2 text-success fw-bold">
-                                  Correct
+                          return (
+                            <Form.Check
+                              key={cIndex}
+                              type="radio"
+                              name={`question-${qIndex}`}
+                              id={`q${qIndex}-choice${cIndex}`}
+                              label={
+                                <span>
+                                  {choice}
+                                  {isSubmitted && isCorrectChoice && (
+                                    <span className="ms-2 text-success fw-bold">
+                                      Correct
+                                    </span>
+                                  )}
+                                  {isSubmitted &&
+                                    isSelected &&
+                                    !isCorrectChoice && (
+                                      <span className="ms-2 text-danger fw-bold">
+                                        Your answer
+                                      </span>
+                                    )}
                                 </span>
-                              )}
-                              {isSubmitted &&
-                                isSelected &&
-                                !isCorrectChoice && (
-                                  <span className="ms-2 text-danger fw-bold">
-                                    Your answer
+                              }
+                              value={choice}
+                              checked={isSelected}
+                              onChange={(e) =>
+                                handleAnswerChange(qIndex, e.target.value)
+                              }
+                              className={`mb-2 ${
+                                isSubmitted && isCorrectChoice
+                                  ? "text-success fw-bold"
+                                  : ""
+                              }`}
+                              disabled={isSubmitted || viewingPreviousAttempt}
+                            />
+                          );
+                        }
+                      )}
+                    </>
+                  ) : isTrueFalse ? (
+                    // TRUE/FALSE
+                    <>
+                      {["True", "False"].map((choice, cIndex) => {
+                        const isSelected = selectedAnswers[qIndex] === choice;
+                        const isCorrectChoice =
+                          isSubmitted &&
+                          choice.toLowerCase().trim() ===
+                            question.correctAnswer?.toLowerCase().trim();
+
+                        return (
+                          <Form.Check
+                            key={cIndex}
+                            type="radio"
+                            name={`question-${qIndex}`}
+                            id={`q${qIndex}-tf-${cIndex}`}
+                            label={
+                              <span>
+                                {choice}
+                                {isSubmitted && isCorrectChoice && (
+                                  <span className="ms-2 text-success fw-bold">
+                                    Correct
                                   </span>
                                 )}
-                            </span>
-                          }
-                          value={choice}
-                          checked={isSelected}
-                          onChange={(e) =>
-                            handleAnswerChange(qIndex, e.target.value)
-                          }
-                          className={`mb-2 ${
-                            isSubmitted && isCorrectChoice
-                              ? "text-success fw-bold"
-                              : ""
-                          }`}
-                          disabled={isSubmitted || viewingPreviousAttempt}
-                        />
-                      );
-                    })
+                                {isSubmitted &&
+                                  isSelected &&
+                                  !isCorrectChoice && (
+                                    <span className="ms-2 text-danger fw-bold">
+                                      Your answer
+                                    </span>
+                                  )}
+                              </span>
+                            }
+                            value={choice}
+                            checked={isSelected}
+                            onChange={(e) =>
+                              handleAnswerChange(qIndex, e.target.value)
+                            }
+                            className={`mb-2 ${
+                              isSubmitted && isCorrectChoice
+                                ? "text-success fw-bold"
+                                : ""
+                            }`}
+                            disabled={isSubmitted || viewingPreviousAttempt}
+                          />
+                        );
+                      })}
+                    </>
                   ) : (
-                    /* Fill in the Blank */
-                    <Form.Group>
-                      <Form.Control
-                        type="text"
-                        placeholder="Enter your answer"
-                        value={selectedAnswers[qIndex] || ""}
-                        onChange={(e) =>
-                          handleAnswerChange(qIndex, e.target.value)
+                    // FIB: multiple blanks
+                    <div>
+                      {Array.from({ length: fibBlanksCount }).map(
+                        (_, blankIndex) => {
+                          const correctText =
+                            fibCorrectAnswers[blankIndex] || "";
+                          const userText = fibUserAnswers[blankIndex] || "";
+                          const thisBlankCorrect =
+                            isSubmitted &&
+                            userText.toString().trim().toLowerCase() ===
+                              correctText.toString().trim().toLowerCase();
+
+                          return (
+                            <Form.Group key={blankIndex} className="mb-2">
+                              <Form.Label>Blank {blankIndex + 1}</Form.Label>
+                              <Form.Control
+                                type="text"
+                                placeholder="Enter your answer"
+                                value={userText}
+                                onChange={(e) =>
+                                  handleFibAnswerChange(
+                                    qIndex,
+                                    blankIndex,
+                                    e.target.value,
+                                    fibBlanksCount
+                                  )
+                                }
+                                disabled={isSubmitted || viewingPreviousAttempt}
+                                className={
+                                  isSubmitted
+                                    ? thisBlankCorrect
+                                      ? "border-success"
+                                      : "border-danger"
+                                    : ""
+                                }
+                              />
+                            </Form.Group>
+                          );
                         }
-                        disabled={isSubmitted || viewingPreviousAttempt}
-                        className={
-                          isSubmitted
-                            ? correct
-                              ? "border-success"
-                              : "border-danger"
-                            : ""
-                        }
-                      />
-                      {isSubmitted && (
+                      )}
+                      {isSubmitted && fibCorrectAnswers.length > 0 && (
                         <Form.Text
                           className={correct ? "text-success" : "text-danger"}
                         >
-                          {correct ? (
-                            <span>Correct!</span>
-                          ) : (
-                            <span>
-                              Correct answer: {question.correctAnswer}
-                            </span>
-                          )}
+                          Correct answers: {fibCorrectAnswers.join(", ")}
                         </Form.Text>
                       )}
-                    </Form.Group>
+                    </div>
                   )}
                 </Form>
               </Card.Body>
